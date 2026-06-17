@@ -4,11 +4,14 @@ const chalk = require('chalk');
 const { parse } = require('csv-parse/sync');
 const { stringify } = require('csv-stringify/sync');
 const { scanDirectory, getFilesByDate, initializeConfig } = require('../utils/scanner');
+const { isDryRun } = require('../utils/logger');
 const { appendLog } = require('../utils/logger');
 
 function readTableFile(filePath) {
   const ext = path.extname(filePath).toLowerCase();
-  if (!['.csv', '.tsv', '.txt'].includes(ext)) return null;
+  if (!['.csv', '.tsv', '.txt'].includes(ext)) {
+    return { ok: false, reason: 'unsupported_extension', records: [] };
+  }
 
   try {
     const content = fs.readFileSync(filePath, 'utf8');
@@ -23,13 +26,25 @@ function readTableFile(filePath) {
       skip_empty_lines: true,
       relax_column_count: true,
     });
-    return records;
-  } catch {
-    return null;
+
+    if (!records || records.length === 0) {
+      return { ok: false, reason: 'empty_table', records: [] };
+    }
+    return { ok: true, reason: null, records };
+  } catch (err) {
+    return { ok: false, reason: 'parse_error:' + err.message, records: [] };
   }
 }
 
-function resolveOutputStrategy(outputOption, batchCount, firstDate) {
+function safeMkdir(dirPath) {
+  if (isDryRun()) return false;
+  if (!fs.existsSync(dirPath)) {
+    fs.mkdirSync(dirPath, { recursive: true });
+  }
+  return true;
+}
+
+function resolveOutputStrategy(outputOption, batchCount) {
   if (!outputOption) {
     return { type: 'auto-dir', message: null };
   }
@@ -75,21 +90,19 @@ function resolveOutputForBatch(strategy, batchDate, defaultDir, defaultStem) {
   switch (strategy.type) {
     case 'auto-dir': {
       const outDir = path.join(defaultDir, 'merged');
-      if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
+      safeMkdir(outDir);
       return path.join(outDir, `${defaultStem}_${batchDate}.csv`);
     }
     case 'explicit-dir': {
-      if (!fs.existsSync(strategy.dir)) fs.mkdirSync(strategy.dir, { recursive: true });
+      safeMkdir(strategy.dir);
       return path.join(strategy.dir, `${defaultStem}_${batchDate}.csv`);
     }
     case 'single-file': {
-      if (!fs.existsSync(path.dirname(strategy.filePath))) {
-        fs.mkdirSync(path.dirname(strategy.filePath), { recursive: true });
-      }
+      safeMkdir(path.dirname(strategy.filePath));
       return strategy.filePath;
     }
     case 'auto-split': {
-      if (!fs.existsSync(strategy.dir)) fs.mkdirSync(strategy.dir, { recursive: true });
+      safeMkdir(strategy.dir);
       return path.join(strategy.dir, `${strategy.stem}_${batchDate}${strategy.ext}`);
     }
   }
@@ -108,49 +121,88 @@ async function mergeCommand(dir, options) {
 
   const byDate = getFilesByDate(dataFiles);
   const mergeResults = [];
+  const pending = [];
 
   for (const [date, dateFiles] of byDate) {
-    if (dateFiles.length < 2) continue;
+    if (dateFiles.length < 2) {
+      if (dateFiles.length === 1) {
+        pending.push({
+          type: 'single_file_batch',
+          date,
+          file: dateFiles[0].basename,
+          detail: `Batch ${date} has only 1 data file (${dateFiles[0].basename}); skipped merge`,
+        });
+      }
+      continue;
+    }
 
     const allRecords = [];
     const sources = [];
+    const samples = new Set();
+    const instruments = new Set();
 
     for (const file of dateFiles) {
-      const records = readTableFile(file.file);
-      if (!records || records.length === 0) continue;
+      const result = readTableFile(file.file);
+      if (!result.ok) {
+        pending.push({
+          type: 'bad_table',
+          date,
+          file: file.basename,
+          reason: result.reason,
+          detail: `Skipped ${file.basename} in batch ${date}: ${result.reason}`,
+        });
+        continue;
+      }
 
-      for (const record of records) {
+      for (const record of result.records) {
         record._source = file.basename;
         record._instrument = file.instrument || 'unknown';
         record._sampleId = file.sampleId || 'unknown';
         allRecords.push(record);
       }
-      sources.push({ file: file.basename, rows: records.length, instrument: file.instrument, sampleId: file.sampleId });
+      sources.push({ file: file.basename, rows: result.records.length, instrument: file.instrument, sampleId: file.sampleId });
+      if (file.sampleId) samples.add(file.sampleId);
+      if (file.instrument) instruments.add(file.instrument);
     }
 
-    if (allRecords.length === 0) continue;
+    if (allRecords.length === 0) {
+      pending.push({
+        type: 'empty_batch_after_parse',
+        date,
+        files: dateFiles.map((f) => f.basename),
+        detail: `Batch ${date} has no valid rows after parsing; skipped`,
+      });
+      continue;
+    }
 
     mergeResults.push({
       date,
       records: allRecords,
       sources,
+      samples: [...samples].sort(),
+      instruments: [...instruments].sort(),
       totalRows: allRecords.length,
     });
   }
 
-  const strategy = resolveOutputStrategy(output, mergeResults.length, mergeResults[0]?.date);
+  const strategy = resolveOutputStrategy(output, mergeResults.length);
+
+  for (const batch of mergeResults) {
+    batch.outputPath = resolveOutputForBatch(strategy, batch.date, dir, 'merged');
+  }
 
   if (quiet) {
     const suffix = dryRun ? ' (dry-run)' : '';
-    console.log(`Merge: ${mergeResults.length} batch(es) to merge, ${mergeResults.reduce((s, m) => s + m.totalRows, 0)} total rows${suffix}`);
-    appendLog({ command: 'merge', action: dryRun ? 'preview' : 'complete', detail: `${mergeResults.length} batches` });
-    return { batches: mergeResults.length, dryRun, results: mergeResults };
+    const pendingNote = pending.length > 0 ? ` | ${pending.length} pending` : '';
+    console.log(`Merge: ${mergeResults.length} batch(es) to merge, ${mergeResults.reduce((s, m) => s + m.totalRows, 0)} total rows${pendingNote}${suffix}`);
+    appendLog({ command: 'merge', action: dryRun ? 'preview' : 'complete', detail: `${mergeResults.length} batches, ${pending.length} pending` });
+    return { batches: mergeResults.length, dryRun, results: mergeResults, pending };
   }
 
-  if (mergeResults.length === 0) {
+  if (mergeResults.length === 0 && pending.length === 0) {
     console.log(chalk.yellow('No batches with multiple files found for merging.'));
     appendLog({ command: 'merge', action: 'skip', detail: 'no batches to merge' });
-    return { batches: 0, dryRun, results: [] };
+    return { batches: 0, dryRun, results: [], pending: [] };
   }
 
   const label = dryRun ? chalk.yellow('🔍 Merge Preview (dry-run)') : chalk.cyan('📎 Merging Tables');
@@ -161,21 +213,24 @@ async function mergeCommand(dir, options) {
     console.log(strategy.message);
   }
 
+  if (mergeResults.length > 0) {
+    console.log(chalk.bold('\n📋 Batch Manifest'));
+    console.log(chalk.dim('─'.repeat(40)));
+  }
+
   for (const batch of mergeResults) {
     console.log(`\n📅 Batch: ${chalk.bold(batch.date)}`);
-    console.log(`   Files: ${batch.sources.length} | Total rows: ${batch.totalRows}`);
-
+    console.log(`   Samples:     ${batch.samples.length > 0 ? batch.samples.join(', ') : chalk.dim('(unknown)')}`);
+    console.log(`   Instruments: ${batch.instruments.length > 0 ? batch.instruments.join(', ') : chalk.dim('(unknown)')}`);
+    console.log(`   Source files: ${batch.sources.length}`);
     for (const src of batch.sources) {
-      console.log(chalk.dim(`   - ${src.file} (${src.rows} rows, ${src.instrument || 'unknown'})`));
+      const meta = [src.instrument || 'unknown-instrument', src.sampleId || 'unknown-sample'].join(' · ');
+      console.log(chalk.dim(`     • ${src.file}  (${src.rows} rows, ${meta})`));
     }
+    console.log(`   Total rows:  ${batch.totalRows}`);
+    console.log(`   Output:      ${dryRun ? chalk.yellow('would write → ') : chalk.green('→ ')}${batch.outputPath}`);
 
-    const outPath = resolveOutputForBatch(strategy, batch.date, dir, 'merged');
-    batch.outputPath = outPath;
-
-    if (dryRun) {
-      console.log(chalk.yellow(`   Would write: ${outPath}`));
-      continue;
-    }
+    if (dryRun) continue;
 
     const allCols = new Set();
     for (const rec of batch.records) {
@@ -187,27 +242,35 @@ async function mergeCommand(dir, options) {
 
     const csv = stringify(batch.records, { header: true, columns });
 
-    if (fs.existsSync(outPath)) {
-      console.log(chalk.yellow(`   ⚠  Overwriting existing: ${outPath}`));
+    if (fs.existsSync(batch.outputPath)) {
+      console.log(chalk.yellow(`   ⚠  Overwriting existing: ${batch.outputPath}`));
     }
-    fs.writeFileSync(outPath, csv, 'utf8');
-    console.log(chalk.green(`   ✓ Written: ${outPath}`));
+    fs.writeFileSync(batch.outputPath, csv, 'utf8');
+    console.log(chalk.green(`   ✓ Written: ${batch.outputPath}`));
+  }
+
+  if (pending.length > 0) {
+    console.log(chalk.bold('\n❓ Pending Confirmation'));
+    console.log(chalk.dim('─'.repeat(40)));
+    for (const p of pending) {
+      console.log(chalk.yellow(`  • [${p.type}] ${p.detail}`));
+    }
   }
 
   console.log(chalk.dim('\n' + '─'.repeat(60)));
   if (dryRun) {
-    console.log(chalk.yellow(`Preview: ${mergeResults.length} batch(es) would be merged`));
+    console.log(chalk.yellow(`Preview: ${mergeResults.length} batch(es) would be merged | ${pending.length} item(s) need confirmation`));
   } else {
-    console.log(chalk.green(`✓ ${mergeResults.length} batch(es) merged successfully`));
+    console.log(chalk.green(`✓ ${mergeResults.length} batch(es) merged successfully | ${pending.length} item(s) pending confirmation`));
   }
 
   appendLog({
     command: 'merge',
     action: dryRun ? 'preview' : 'complete',
-    detail: `${mergeResults.length} batches, ${mergeResults.reduce((s, m) => s + m.totalRows, 0)} total rows`,
+    detail: `${mergeResults.length} batches, ${mergeResults.reduce((s, m) => s + m.totalRows, 0)} total rows, ${pending.length} pending`,
   });
 
-  return { batches: mergeResults.length, dryRun, results: mergeResults };
+  return { batches: mergeResults.length, dryRun, results: mergeResults, pending };
 }
 
 module.exports = { mergeCommand };

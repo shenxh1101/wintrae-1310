@@ -2,7 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const chalk = require('chalk');
 const { parse } = require('csv-parse/sync');
-const { scanDirectory, getFilesBySample, getFilesByDate, initializeConfig } = require('../utils/scanner');
+const { scanDirectory, getFilesBySample, initializeConfig } = require('../utils/scanner');
 const { appendLog } = require('../utils/logger');
 
 function readCsvContent(filePath) {
@@ -130,16 +130,16 @@ function checkEmptyValues(files) {
 }
 
 const UNIT_RULES = [
-  { columnTest: /conc|concentration|amount/i, label: 'concentration/amount', units: ['mg/L', 'ug/mL', 'ng/mL', 'mM', 'uM', 'nM', 'ppm', 'ppb', 'g/L', 'μg/mL', 'mg/mL'] },
-  { columnTest: /temp|temperature/i, label: 'temperature', units: ['°C', 'C', 'K', '°F', 'F'] },
-  { columnTest: /weight|mass/i, label: 'weight/mass', units: ['mg', 'g', 'kg', 'ug', 'μg', 'ng'] },
-  { columnTest: /volume/i, label: 'volume', units: ['mL', 'L', 'uL', 'μL', 'nL', 'pL'] },
-  { columnTest: /time/i, label: 'time', units: ['s', 'sec', 'min', 'h', 'hr', 'ms'] },
-  { columnTest: /pressure/i, label: 'pressure', units: ['Pa', 'kPa', 'MPa', 'bar', 'atm', 'psi', 'mmHg'] },
-  { columnTest: /ph|pH/, label: 'pH', units: [] },
-  { columnTest: /wavelength|nm/i, label: 'wavelength', units: ['nm', 'μm', 'um'] },
-  { columnTest: /absorbance|abs|od/i, label: 'absorbance/OD', units: [] },
-  { columnTest: /intensity|signal|count/i, label: 'intensity/signal', units: ['cps', 'AU'] },
+  { metricTest: /conc|concentration|amount/i, label: 'concentration/amount', units: ['mg/L', 'ug/mL', 'ng/mL', 'mM', 'uM', 'nM', 'ppm', 'ppb', 'g/L', 'μg/mL', 'mg/mL', 'ug/L', 'μg/L', 'ng/L'] },
+  { metricTest: /temp|temperature/i, label: 'temperature', units: ['°C', 'C', 'K', '°F', 'F'] },
+  { metricTest: /weight|mass/i, label: 'weight/mass', units: ['mg', 'g', 'kg', 'ug', 'μg', 'ng'] },
+  { metricTest: /volume/i, label: 'volume', units: ['mL', 'L', 'uL', 'μL', 'nL', 'pL'] },
+  { metricTest: /time/i, label: 'time', units: ['s', 'sec', 'min', 'h', 'hr', 'ms'] },
+  { metricTest: /pressure/i, label: 'pressure', units: ['Pa', 'kPa', 'MPa', 'bar', 'atm', 'psi', 'mmHg'] },
+  { metricTest: /ph|pH/, label: 'pH', units: [] },
+  { metricTest: /wavelength|nm/i, label: 'wavelength', units: ['nm', 'μm', 'um'] },
+  { metricTest: /absorbance|abs|od/i, label: 'absorbance/OD', units: [] },
+  { metricTest: /intensity|signal|count/i, label: 'intensity/signal', units: ['cps', 'AU'] },
 ];
 
 function extractUnitsFromValue(val, candidateUnits) {
@@ -159,12 +159,91 @@ function extractUnitsFromValue(val, candidateUnits) {
   return null;
 }
 
+function buildAllUnitsSet() {
+  const set = new Set();
+  for (const rule of UNIT_RULES) {
+    for (const u of rule.units) set.add(u.toLowerCase());
+  }
+  return set;
+}
+
+function tryExtractSuffixUnit(col, allUnits) {
+  const seps = /[_]+/;
+  const parts = col.split(seps);
+  if (parts.length < 2) return null;
+
+  for (let start = Math.max(1, parts.length - 3); start < parts.length; start++) {
+    const candidate = parts.slice(start).join('_').replace(/_/g, '/');
+    const candidateAlt = parts.slice(start).join('/');
+    const candidateSimple = parts.slice(start).join('');
+    const tries = [candidate, candidateAlt, candidateSimple];
+    for (const t of tries) {
+      if (allUnits.has(t.toLowerCase())) {
+        const metric = parts.slice(0, start).join('_');
+        return { metric, unit: t };
+      }
+    }
+    if (start + 1 < parts.length) {
+      const a = parts.slice(start, start + 1).join('');
+      const b = parts.slice(start + 1).join('');
+      const compound = `${a}/${b}`;
+      if (allUnits.has(compound.toLowerCase())) {
+        const metric = parts.slice(0, start).join('_');
+        return { metric, unit: compound };
+      }
+    }
+  }
+
+  const m = col.match(/^(.+?)[_\s]+([A-Za-zμ°]+(?:\/[A-Za-zμ°]+)?)$/);
+  if (m) {
+    const maybeUnit = m[2];
+    if (allUnits.has(maybeUnit.toLowerCase()) || maybeUnit.length <= 5) {
+      return { metric: m[1].trim(), unit: maybeUnit };
+    }
+  }
+  return null;
+}
+
+function parseColumnName(col) {
+  let metric = col;
+  let unit = null;
+
+  let m = col.match(/^(.+?)[_\s]*[\[\(]([^\]\)]+)[\]\)]\s*$/);
+  if (m) {
+    metric = m[1].trim();
+    unit = m[2].trim();
+  } else {
+    const allUnits = buildAllUnitsSet();
+    const extracted = tryExtractSuffixUnit(col, allUnits);
+    if (extracted) {
+      metric = extracted.metric;
+      unit = extracted.unit;
+    }
+  }
+
+  metric = metric.replace(/[_\s]+$/g, '').replace(/^[_\s]+/g, '').trim();
+
+  let label = metric;
+  for (const rule of UNIT_RULES) {
+    if (rule.metricTest.test(metric)) {
+      label = rule.label;
+      break;
+    }
+  }
+
+  return { raw: col, metric, unit, label };
+}
+
+function normalizeMetricKey(metric) {
+  return metric.toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
 function checkUnitConsistency(files) {
   const issues = [];
 
   const dataFiles = files.filter((f) => f.isDataFile && ['.csv', '.tsv', '.txt'].includes(f.ext));
 
-  const columnIndex = new Map();
+  const metricIndex = new Map();
 
   for (const file of dataFiles) {
     const records = readCsvContent(file.file);
@@ -172,50 +251,68 @@ function checkUnitConsistency(files) {
     const columns = Object.keys(records[0]);
 
     for (const col of columns) {
+      const parsed = parseColumnName(col);
+      const metricKey = normalizeMetricKey(parsed.metric);
+      if (!metricKey) continue;
+
       let matchedRule = null;
       for (const rule of UNIT_RULES) {
-        if (rule.columnTest.test(col)) {
+        if (rule.metricTest.test(parsed.metric)) {
           matchedRule = rule;
           break;
         }
       }
       if (!matchedRule) continue;
 
-      if (!columnIndex.has(col)) {
-        columnIndex.set(col, {
+      if (!metricIndex.has(metricKey)) {
+        metricIndex.set(metricKey, {
+          metric: parsed.metric,
           label: matchedRule.label,
           unitMap: new Map(),
+          columns: new Set(),
         });
       }
+      const entry = metricIndex.get(metricKey);
+      entry.columns.add(parsed.raw);
 
-      const entry = columnIndex.get(col);
+      if (parsed.unit) {
+        const u = parsed.unit;
+        if (!entry.unitMap.has(u)) entry.unitMap.set(u, new Set());
+        entry.unitMap.get(u).add(file.basename + ' [col:' + parsed.raw + ']');
+      }
+
+      const candidateUnits = matchedRule.units;
       for (const record of records) {
-        const unit = extractUnitsFromValue(record[col], matchedRule.units);
-        if (!unit) continue;
-        if (!entry.unitMap.has(unit)) entry.unitMap.set(unit, new Set());
-        entry.unitMap.get(unit).add(file.basename);
+        const u = extractUnitsFromValue(record[col], candidateUnits);
+        if (!u) continue;
+        if (!entry.unitMap.has(u)) entry.unitMap.set(u, new Set());
+        entry.unitMap.get(u).add(file.basename + ' [col:' + parsed.raw + ']');
       }
     }
   }
 
-  for (const [col, data] of columnIndex) {
+  for (const [, data] of metricIndex) {
     if (data.unitMap.size > 1) {
       const unitList = [...data.unitMap.entries()].map(([u, fs]) => ({
         unit: u,
         files: [...fs].sort(),
       }));
       unitList.sort((a, b) => a.unit.localeCompare(b.unit));
+
+      const colList = [...data.columns].sort().join(', ');
       const breakdown = unitList.map((u) => {
         const fStr = u.files.length <= 5 ? u.files.join(', ') : `${u.files.slice(0, 5).join(', ')} ... (+${u.files.length - 5})`;
         return `${u.unit} in [${fStr}]`;
       }).join('; ');
+
       issues.push({
         type: 'unit_inconsistency',
         severity: 'warn',
-        column: col,
+        metric: data.metric,
         label: data.label,
+        columns: colList,
         unitList,
-        detail: `Column "${col}" (${data.label}) has mixed units across files: ${breakdown}`,
+        detail: `Metric "${data.metric}" (${data.label}), matched columns [${colList}] has mixed units: ${breakdown}`,
       });
     }
   }
@@ -263,7 +360,7 @@ async function checkCommand(dir, options) {
       console.log(chalk.yellow(`\n⚠️  Warnings (${warns.length}):`));
       for (const issue of warns) {
         if (issue.type === 'unit_inconsistency' && issue.unitList) {
-          console.log(chalk.yellow(`  • [unit_inconsistency] Column "${issue.column}" (${issue.label}):`));
+          console.log(chalk.yellow(`  • [unit_inconsistency] Metric "${issue.metric}" (${issue.label}) — columns: [${issue.columns}]`));
           for (const u of issue.unitList) {
             const fStr = u.files.join(', ');
             console.log(chalk.dim(`      - ${u.unit}: ${fStr}`));
