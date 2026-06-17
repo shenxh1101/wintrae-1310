@@ -1,13 +1,45 @@
 const fs = require('fs');
 const path = require('path');
 const { glob } = require('glob');
-const { extractSampleId, extractDate, extractInstrument, DATA_EXTENSIONS } = require('./patterns');
+const { extractSampleId, extractDate, extractInstrument, getDataExtensions, getActiveConfig, resetPatterns, applyConfig } = require('./patterns');
+const { loadConfig } = require('./config');
+
+let configLoaded = null;
+
+function initializeConfig(dir) {
+  resetPatterns();
+  try {
+    const cfg = loadConfig(dir);
+    if (cfg) {
+      applyConfig(cfg);
+      configLoaded = cfg.filePath;
+    } else {
+      configLoaded = null;
+      applyConfig(null);
+    }
+    return configLoaded;
+  } catch (err) {
+    applyConfig(null);
+    configLoaded = null;
+    throw err;
+  }
+}
+
+function getLoadedConfigPath() {
+  return configLoaded;
+}
 
 async function scanDirectory(dir, filter) {
+  if (configLoaded === null) {
+    initializeConfig(dir);
+  }
+
   const pattern = filter || '**/*';
   const files = await glob(pattern, { cwd: dir, absolute: true, nodir: true });
 
+  const dataExtensions = getDataExtensions();
   const results = [];
+
   for (const filePath of files) {
     const basename = path.basename(filePath);
     const ext = path.extname(basename).toLowerCase();
@@ -29,7 +61,7 @@ async function scanDirectory(dir, filter) {
       dateRaw: dateInfo ? dateInfo.raw : null,
       dateFormat: dateInfo ? dateInfo.format : null,
       instrument: instrument || null,
-      isDataFile: DATA_EXTENSIONS.has(ext),
+      isDataFile: dataExtensions.has(ext),
     });
   }
 
@@ -74,4 +106,7 @@ module.exports = {
   getFilesBySample,
   getFilesByDate,
   getFilesByInstrument,
+  initializeConfig,
+  getLoadedConfigPath,
+  getActiveConfig,
 };

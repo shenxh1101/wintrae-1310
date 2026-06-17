@@ -1,10 +1,15 @@
 const chalk = require('chalk');
-const { scanDirectory, getFilesBySample, getFilesByDate, getFilesByInstrument } = require('../utils/scanner');
+const { scanDirectory, getFilesBySample, getFilesByDate, getFilesByInstrument, initializeConfig, getLoadedConfigPath } = require('../utils/scanner');
 const { appendLog } = require('../utils/logger');
 
 async function scanCommand(dir, options) {
   const filter = options.filter || null;
   const quiet = options.quiet || false;
+
+  const cfgPath = initializeConfig(dir);
+  if (!quiet && cfgPath) {
+    console.log(chalk.blue(`ℹ  Using custom rules from: ${cfgPath}`));
+  }
 
   const files = await scanDirectory(dir, filter);
 

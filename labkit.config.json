@@ -1,0 +1,14 @@
+{
+  "samplePatterns": [
+    { "regex": "(?:^|[-_\\s])(EXP-(\\d{4}))", "group": "EXP-NNNN", "captureGroup": 1 }
+  ],
+  "datePatterns": [
+    { "regex": "(\\d{2})_(\\d{2})_(\\d{4})", "format": "DD_MM_YYYY", "order": ["day", "month", "year"] }
+  ],
+  "instrumentAliases": {
+    "MassSpec": ["ms", "ms-spec", "tims-tof", "orbitrap"],
+    "PlateReader": ["plate", "reader", "envision"]
+  },
+  "dataExtensions": ["csv", "dat", "ods"],
+  "mergeDefault": true
+}

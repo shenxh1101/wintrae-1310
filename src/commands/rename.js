@@ -1,7 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const chalk = require('chalk');
-const { scanDirectory } = require('../utils/scanner');
+const { scanDirectory, initializeConfig } = require('../utils/scanner');
 const { appendLog } = require('../utils/logger');
 
 function generateNewName(file) {
@@ -33,6 +33,11 @@ async function renameCommand(dir, options) {
   const filter = options.filter || null;
   const dryRun = options.dryRun || false;
   const quiet = options.quiet || false;
+
+  const cfgPath = initializeConfig(dir);
+  if (!quiet && cfgPath) {
+    console.log(chalk.blue(`ℹ  Using custom rules from: ${cfgPath}`));
+  }
 
   const files = await scanDirectory(dir, filter);
   const plans = [];

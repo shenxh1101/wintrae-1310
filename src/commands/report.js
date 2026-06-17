@@ -1,11 +1,13 @@
 const chalk = require('chalk');
 const { readLog } = require('../utils/logger');
-const { scanDirectory, getFilesBySample, getFilesByInstrument } = require('../utils/scanner');
+const { scanDirectory, getFilesBySample, getFilesByInstrument, initializeConfig, getLoadedConfigPath } = require('../utils/scanner');
 const { appendLog } = require('../utils/logger');
 
 async function reportCommand(dir, options) {
   const filter = options.filter || null;
   const quiet = options.quiet || false;
+
+  const cfgPath = initializeConfig(dir);
 
   const files = await scanDirectory(dir, filter);
   const bySample = getFilesBySample(files);
@@ -66,6 +68,10 @@ async function reportCommand(dir, options) {
 
   console.log(chalk.cyan(`\n📋 Report for: ${dir}`));
   console.log(chalk.dim('═'.repeat(60)));
+
+  if (cfgPath) {
+    console.log(chalk.blue(`ℹ  Custom rules loaded from: ${cfgPath}`));
+  }
 
   console.log(chalk.bold('\n📊 Sample Statistics'));
   console.log(chalk.dim('─'.repeat(40)));

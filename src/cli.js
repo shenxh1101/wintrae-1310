@@ -7,6 +7,23 @@ const { checkCommand } = require('./commands/check');
 const { mergeCommand } = require('./commands/merge');
 const { reportCommand } = require('./commands/report');
 
+function addCommonOptions(cmd, isReadOnly) {
+  cmd.option('-f, --filter <pattern>', 'glob pattern to filter files (e.g. "*.csv")');
+  if (isReadOnly) {
+    cmd.option('--dry-run', 'no-op for read-only commands; explicitly confirms no files will be modified');
+  } else {
+    cmd.option('--dry-run', 'preview changes without applying them');
+  }
+  cmd.option('-q, --quiet', 'show concise results only');
+  return cmd;
+}
+
+function handleDryRunBanner(cmd, opts, quiet) {
+  if (opts.dryRun && !quiet) {
+    console.log(chalk.blue(`ℹ  [dry-run] ${cmd} is a read-only command; no files will be modified.`));
+  }
+}
+
 function createProgram() {
   const program = new Command();
 
@@ -19,10 +36,9 @@ function createProgram() {
     .command('scan')
     .description('Scan directory and identify sample IDs, dates, and instrument sources')
     .argument('[dir]', 'target directory', '.')
-    .option('-f, --filter <pattern>', 'glob pattern to filter files (e.g. "*.csv")')
-    .option('-q, --quiet', 'show concise results only')
     .action(async (dir, opts) => {
       try {
+        handleDryRunBanner('scan', opts, opts.quiet);
         const resolved = path.resolve(dir);
         await scanCommand(resolved, opts);
       } catch (err) {
@@ -35,9 +51,6 @@ function createProgram() {
     .command('rename')
     .description('Rename files to unified naming convention (preview with --dry-run)')
     .argument('[dir]', 'target directory', '.')
-    .option('-f, --filter <pattern>', 'glob pattern to filter files')
-    .option('--dry-run', 'preview changes without applying them')
-    .option('-q, --quiet', 'show concise results only')
     .action(async (dir, opts) => {
       try {
         const resolved = path.resolve(dir);
@@ -52,10 +65,9 @@ function createProgram() {
     .command('check')
     .description('Check for missing files, duplicate samples, empty values, and unit inconsistencies')
     .argument('[dir]', 'target directory', '.')
-    .option('-f, --filter <pattern>', 'glob pattern to filter files')
-    .option('-q, --quiet', 'show concise results only')
     .action(async (dir, opts) => {
       try {
+        handleDryRunBanner('check', opts, opts.quiet);
         const resolved = path.resolve(dir);
         await checkCommand(resolved, opts);
       } catch (err) {
@@ -68,10 +80,7 @@ function createProgram() {
     .command('merge')
     .description('Merge tables from the same batch and retain source information')
     .argument('[dir]', 'target directory', '.')
-    .option('-f, --filter <pattern>', 'glob pattern to filter files')
-    .option('--dry-run', 'preview merge without writing files')
-    .option('-o, --output <path>', 'output file path for merged result')
-    .option('-q, --quiet', 'show concise results only')
+    .option('-o, --output <path>', 'output file path or directory for merged results')
     .action(async (dir, opts) => {
       try {
         const resolved = path.resolve(dir);
@@ -86,10 +95,9 @@ function createProgram() {
     .command('report')
     .description('Generate report with sample counts, anomalies, processing log, and pending items')
     .argument('[dir]', 'target directory', '.')
-    .option('-f, --filter <pattern>', 'glob pattern to filter files')
-    .option('-q, --quiet', 'show concise results only')
     .action(async (dir, opts) => {
       try {
+        handleDryRunBanner('report', opts, opts.quiet);
         const resolved = path.resolve(dir);
         await reportCommand(resolved, opts);
       } catch (err) {
@@ -97,6 +105,12 @@ function createProgram() {
         process.exit(1);
       }
     });
+
+  for (const cmd of program.commands) {
+    const name = cmd.name();
+    const isReadOnly = ['scan', 'check', 'report'].includes(name);
+    addCommonOptions(cmd, isReadOnly);
+  }
 
   return program;
 }

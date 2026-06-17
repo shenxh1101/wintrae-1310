@@ -2,7 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const chalk = require('chalk');
 const { parse } = require('csv-parse/sync');
-const { scanDirectory, getFilesBySample } = require('../utils/scanner');
+const { scanDirectory, getFilesBySample, getFilesByDate, initializeConfig } = require('../utils/scanner');
 const { appendLog } = require('../utils/logger');
 
 function readCsvContent(filePath) {
@@ -97,12 +97,14 @@ function checkEmptyValues(files) {
 
     const columns = Object.keys(records[0]);
     let emptyCount = 0;
+    const emptyByCol = new Map();
 
     for (const record of records) {
       for (const col of columns) {
         const val = (record[col] || '').toString().trim();
         if (val === '' || val === 'NA' || val === 'N/A' || val === 'null' || val === 'NaN' || val === '-') {
           emptyCount++;
+          emptyByCol.set(col, (emptyByCol.get(col) || 0) + 1);
         }
       }
     }
@@ -110,11 +112,16 @@ function checkEmptyValues(files) {
     if (emptyCount > 0) {
       const totalCells = records.length * columns.length;
       const ratio = (emptyCount / totalCells).toFixed(2);
+      const topCols = [...emptyByCol.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 3)
+        .map(([c, n]) => `${c}:${n}`)
+        .join(', ');
       issues.push({
         type: 'empty_value',
         severity: ratio > 0.3 ? 'error' : 'warn',
         file: file.basename,
-        detail: `${emptyCount} empty/anomalous cells out of ${totalCells} (${ratio}) in ${file.basename}`,
+        detail: `${emptyCount} empty/anomalous cells out of ${totalCells} (${ratio}) in ${file.basename}. Top columns: ${topCols}`,
       });
     }
   }
@@ -122,61 +129,95 @@ function checkEmptyValues(files) {
   return issues;
 }
 
+const UNIT_RULES = [
+  { columnTest: /conc|concentration|amount/i, label: 'concentration/amount', units: ['mg/L', 'ug/mL', 'ng/mL', 'mM', 'uM', 'nM', 'ppm', 'ppb', 'g/L', 'μg/mL', 'mg/mL'] },
+  { columnTest: /temp|temperature/i, label: 'temperature', units: ['°C', 'C', 'K', '°F', 'F'] },
+  { columnTest: /weight|mass/i, label: 'weight/mass', units: ['mg', 'g', 'kg', 'ug', 'μg', 'ng'] },
+  { columnTest: /volume/i, label: 'volume', units: ['mL', 'L', 'uL', 'μL', 'nL', 'pL'] },
+  { columnTest: /time/i, label: 'time', units: ['s', 'sec', 'min', 'h', 'hr', 'ms'] },
+  { columnTest: /pressure/i, label: 'pressure', units: ['Pa', 'kPa', 'MPa', 'bar', 'atm', 'psi', 'mmHg'] },
+  { columnTest: /ph|pH/, label: 'pH', units: [] },
+  { columnTest: /wavelength|nm/i, label: 'wavelength', units: ['nm', 'μm', 'um'] },
+  { columnTest: /absorbance|abs|od/i, label: 'absorbance/OD', units: [] },
+  { columnTest: /intensity|signal|count/i, label: 'intensity/signal', units: ['cps', 'AU'] },
+];
+
+function extractUnitsFromValue(val, candidateUnits) {
+  const s = String(val || '').trim();
+  if (!s) return null;
+  const sorted = [...candidateUnits].sort((a, b) => b.length - a.length);
+  for (const u of sorted) {
+    if (!u) continue;
+    if (s === u) return u;
+    if (s.endsWith(u)) return u;
+    const lower = s.toLowerCase();
+    const uLower = u.toLowerCase();
+    if (lower.endsWith(uLower)) return u;
+  }
+  const m = s.match(/^-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\s*([A-Za-zμ°Ω%]+\/?[A-Za-zμ°]*)$/);
+  if (m && m[1]) return m[1];
+  return null;
+}
+
 function checkUnitConsistency(files) {
   const issues = [];
 
-  const unitPatterns = [
-    { column: /conc|concentration|amount/i, expectedUnits: ['mg/L', 'ug/mL', 'ng/mL', 'mM', 'uM', 'nM', 'ppm', 'ppb'] },
-    { column: /temp|temperature/i, expectedUnits: ['°C', 'C', 'K', '°F'] },
-    { column: /weight|mass/i, expectedUnits: ['mg', 'g', 'kg', 'ug'] },
-    { column: /volume/i, expectedUnits: ['mL', 'L', 'uL', 'nL'] },
-    { column: /time/i, expectedUnits: ['s', 'min', 'h', 'ms'] },
-  ];
+  const dataFiles = files.filter((f) => f.isDataFile && ['.csv', '.tsv', '.txt'].includes(f.ext));
 
-  const filesWithUnits = new Map();
+  const columnIndex = new Map();
 
-  for (const file of files) {
-    if (!file.isDataFile) continue;
-    if (!['.csv', '.tsv', '.txt'].includes(file.ext)) continue;
-
+  for (const file of dataFiles) {
     const records = readCsvContent(file.file);
     if (!records || records.length === 0) continue;
-
     const columns = Object.keys(records[0]);
 
     for (const col of columns) {
-      for (const pat of unitPatterns) {
-        if (pat.column.test(col)) {
-          const unitSet = new Set();
-          for (const record of records) {
-            const val = (record[col] || '').toString().trim();
-            for (const unit of pat.expectedUnits) {
-              if (val.endsWith(unit)) {
-                unitSet.add(unit);
-              }
-            }
-          }
-
-          if (unitSet.size > 1) {
-            const key = `${col}`;
-            if (!filesWithUnits.has(key)) filesWithUnits.set(key, new Map());
-            for (const u of unitSet) {
-              if (!filesWithUnits.get(key).has(u)) filesWithUnits.get(key).set(u, []);
-              filesWithUnits.get(key).get(u).push(file.basename);
-            }
-          }
+      let matchedRule = null;
+      for (const rule of UNIT_RULES) {
+        if (rule.columnTest.test(col)) {
+          matchedRule = rule;
+          break;
         }
+      }
+      if (!matchedRule) continue;
+
+      if (!columnIndex.has(col)) {
+        columnIndex.set(col, {
+          label: matchedRule.label,
+          unitMap: new Map(),
+        });
+      }
+
+      const entry = columnIndex.get(col);
+      for (const record of records) {
+        const unit = extractUnitsFromValue(record[col], matchedRule.units);
+        if (!unit) continue;
+        if (!entry.unitMap.has(unit)) entry.unitMap.set(unit, new Set());
+        entry.unitMap.get(unit).add(file.basename);
       }
     }
   }
 
-  for (const [col, unitMap] of filesWithUnits) {
-    const units = Array.from(unitMap.keys());
-    issues.push({
-      type: 'unit_inconsistency',
-      severity: 'warn',
-      detail: `Column "${col}" has mixed units: ${units.join(', ')} across files`,
-    });
+  for (const [col, data] of columnIndex) {
+    if (data.unitMap.size > 1) {
+      const unitList = [...data.unitMap.entries()].map(([u, fs]) => ({
+        unit: u,
+        files: [...fs].sort(),
+      }));
+      unitList.sort((a, b) => a.unit.localeCompare(b.unit));
+      const breakdown = unitList.map((u) => {
+        const fStr = u.files.length <= 5 ? u.files.join(', ') : `${u.files.slice(0, 5).join(', ')} ... (+${u.files.length - 5})`;
+        return `${u.unit} in [${fStr}]`;
+      }).join('; ');
+      issues.push({
+        type: 'unit_inconsistency',
+        severity: 'warn',
+        column: col,
+        label: data.label,
+        unitList,
+        detail: `Column "${col}" (${data.label}) has mixed units across files: ${breakdown}`,
+      });
+    }
   }
 
   return issues;
@@ -185,6 +226,8 @@ function checkUnitConsistency(files) {
 async function checkCommand(dir, options) {
   const filter = options.filter || null;
   const quiet = options.quiet || false;
+
+  initializeConfig(dir);
 
   const files = await scanDirectory(dir, filter);
 
@@ -219,7 +262,15 @@ async function checkCommand(dir, options) {
     if (warns.length > 0) {
       console.log(chalk.yellow(`\n⚠️  Warnings (${warns.length}):`));
       for (const issue of warns) {
-        console.log(chalk.yellow(`  • [${issue.type}] ${issue.detail}`));
+        if (issue.type === 'unit_inconsistency' && issue.unitList) {
+          console.log(chalk.yellow(`  • [unit_inconsistency] Column "${issue.column}" (${issue.label}):`));
+          for (const u of issue.unitList) {
+            const fStr = u.files.join(', ');
+            console.log(chalk.dim(`      - ${u.unit}: ${fStr}`));
+          }
+        } else {
+          console.log(chalk.yellow(`  • [${issue.type}] ${issue.detail}`));
+        }
       }
     }
   }
